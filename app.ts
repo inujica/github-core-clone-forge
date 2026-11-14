@@ -11,10 +11,14 @@
 // and its replay answer byte for byte alike.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { handleGitHttp } from './git.ts';
 import { handleRest } from './rest.ts';
 import { Forge } from './store.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
+
+/** `/{owner}/{repo}.git/{info/refs|git-upload-pack|git-receive-pack}`: the smart-HTTP surface. */
+const GIT_PATH = /^\/([^/]+)\/([^/]+?)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/;
 
 /** The login the bearer token names. The suite's one seeded viewer, overridable for a local run. */
 const DEFAULT_LOGIN = 'adaiversen';
@@ -108,6 +112,33 @@ async function handle(req: IncomingMessage, res: ServerResponse, forge: Forge, r
   if (pathname === '/healthz' || pathname === '/healthz/') {
     if (BODY_METHODS.has(method)) await readBody(req).catch(() => Buffer.alloc(0));
     return sendJson(res, requestId, 200, { ok: true });
+  }
+
+  // The git smart-HTTP surface. It is routed before the JSON body parse: its bodies are pkt-lines
+  // and a raw packfile, not JSON.
+  const gitMatch = GIT_PATH.exec(pathname);
+  if (gitMatch !== null) {
+    let raw: Buffer = Buffer.alloc(0);
+    if (BODY_METHODS.has(method)) {
+      try {
+        raw = await readBody(req);
+      } catch {
+        return sendJson(res, requestId, 413, { message: 'Request body too large' });
+      }
+    }
+    handleGitHttp({
+      res,
+      forge,
+      requestId,
+      method,
+      query: url.searchParams,
+      owner: decodeURIComponent(gitMatch[1] as string),
+      repo: decodeURIComponent(gitMatch[2] as string),
+      action: gitMatch[3] as string,
+      gitProtocol: String(req.headers['git-protocol'] ?? ''),
+      body: raw,
+    });
+    return;
   }
 
   let body: unknown;

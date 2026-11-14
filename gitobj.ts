@@ -10,8 +10,8 @@
 
 import { createHash } from 'node:crypto';
 
-/** The three object types this forge writes. */
-export type ObjectType = 'blob' | 'tree' | 'commit';
+/** The four object types git stores. */
+export type ObjectType = 'blob' | 'tree' | 'commit' | 'tag';
 
 /** The git object id of `data` framed as `type`. */
 export function hashObject(type: ObjectType, data: Buffer): string {

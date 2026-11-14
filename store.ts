@@ -81,6 +81,8 @@ export interface Repo {
   updatedAt: string;
   pushedAt: string;
   readonly branches: Map<string, string>;
+  /** Full ref name (`refs/heads/main`, `refs/tags/v1`) -> object id, for what git pushed. */
+  readonly refs: Map<string, string>;
   readonly commits: Map<string, CommitRecord>;
   /** sha -> raw bytes for blobs and trees (commit bodies live in `commits`). */
   readonly objects: Map<string, Buffer>;
@@ -166,6 +168,7 @@ export class Forge {
       updatedAt: this.nowIso,
       pushedAt: this.nowIso,
       branches: new Map<string, string>(),
+      refs: new Map<string, string>(),
       commits: new Map<string, CommitRecord>(),
       objects: new Map<string, Buffer>(),
       objectTypes: new Map<string, ObjectType>(),

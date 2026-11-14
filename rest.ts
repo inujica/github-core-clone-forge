@@ -513,6 +513,7 @@ function patchRepo(rest: RestRequest, repo: Repo): void {
       return sendError(rest.res, rest.requestId, 422, 'Repository creation failed.');
     }
     for (const [branch, sha] of repo.branches) renamed.branches.set(branch, sha);
+    for (const [ref, sha] of repo.refs) renamed.refs.set(ref, sha);
     for (const [sha, content] of repo.objects) renamed.objects.set(sha, content);
     for (const [sha, type] of repo.objectTypes) renamed.objectTypes.set(sha, type);
     for (const [sha, record] of repo.commits) renamed.commits.set(sha, record);
