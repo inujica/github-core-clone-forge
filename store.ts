@@ -129,6 +129,7 @@ export class Forge {
 
   constructor(options: { login: string; name: string; email: string; token: string; nowIso: string; nowSec: number }) {
     this.user = { id: 1000, login: options.login, name: options.name, email: options.email };
+    this.loginLower = options.login.toLowerCase();
     this.token = options.token;
     this.nowIso = options.nowIso;
     this.nowSec = options.nowSec;
@@ -145,13 +146,20 @@ export class Forge {
     return `${owner.toLowerCase()}/${name.toLowerCase()}`;
   }
 
+  /** The login in the case a lookup compares it in, kept once. */
+  private readonly loginLower: string;
+
   getRepo(owner: string, name: string): Repo | null {
+    // The common case is a key already in its stored case, which needs no lowercasing at all.
+    const direct = this.repos.get(`${owner}/${name}`);
+    if (direct !== undefined) return direct;
     return this.repos.get(Forge.key(owner, name)) ?? null;
   }
 
   /** Whether `owner` is this forge's user (any other owner sees nothing, and gets 404, never 403). */
   ownsLogin(owner: string): boolean {
-    return owner.toLowerCase() === this.user.login.toLowerCase();
+    if (owner === this.user.login) return true;
+    return owner.toLowerCase() === this.loginLower;
   }
 
   createRepo(name: string, options: { description?: string; private?: boolean } = {}): Repo | null {

@@ -18,10 +18,66 @@ export interface RestRequest {
   readonly res: ServerResponse;
   readonly forge: Forge;
   readonly requestId: string;
-  readonly url: URL;
+  /** The request's path, still percent-encoded, exactly as `new URL(target).pathname` gives it. */
+  readonly pathname: string;
+  /** The request's query parameters. */
+  readonly query: URLSearchParams;
   readonly body: unknown;
   readonly method: string;
   readonly origin: string;
+}
+
+// ---------------------------------------------------------------------------------------------
+// serialization cache
+//
+// A GET of an issue rebuilds the same ~1 KB of JSON on every request: an object with twenty-odd
+// properties, eight absolute URLs and the viewer's user object, then a stringify of all of it. The
+// bytes only change when the issue does, so the text is kept per issue and thrown away the moment
+// anything in the store can have moved.
+//
+// Invalidation is one integer: `noteMutation()` bumps it for every request whose method can write
+// (app.ts calls it before dispatch), and a cached text is only reused while the epoch it was built
+// under is still the current one. A POST that fails still bumps it — a wasted rebuild, never a stale
+// answer. Nothing here touches the bytes: a hit returns the same string a rebuild would produce.
+
+/** The store's mutation epoch: bumped by every request that may write. */
+let storeEpoch = 0;
+
+/** Record that a request which may mutate the store is about to run. */
+export function noteMutation(): void {
+  storeEpoch += 1;
+}
+
+/** One issue's serialized body, valid while `epoch` is the store's current epoch and the origin matches. */
+interface CachedIssueBody {
+  readonly epoch: number;
+  readonly origin: string;
+  /** The body as bytes: the socket takes it as-is, with no per-request UTF-8 encode. */
+  readonly bytes: Buffer;
+  readonly length: number;
+}
+
+const issueBodyCache = new WeakMap<IssueRecord, CachedIssueBody>();
+
+/** An issue's JSON body as bytes (with the trailing newline sendJson adds), cached per issue. */
+function issueBodyOf(forge: Forge, repo: Repo, issue: IssueRecord, origin: string): CachedIssueBody {
+  const cached = issueBodyCache.get(issue);
+  if (cached !== undefined && cached.epoch === storeEpoch && cached.origin === origin) return cached;
+  const bytes = Buffer.from(`${JSON.stringify(issueJson(forge, repo, issue, origin))}\n`, 'utf8');
+  const entry: CachedIssueBody = { epoch: storeEpoch, origin, bytes, length: bytes.length };
+  issueBodyCache.set(issue, entry);
+  return entry;
+}
+
+/** The viewer's user object, cached per forge: it never changes, so every issue shares one. */
+const userJsonCache = new WeakMap<Forge, { origin: string; json: Json }>();
+
+function cachedUserJson(forge: Forge, origin: string): Json {
+  const cached = userJsonCache.get(forge);
+  if (cached !== undefined && cached.origin === origin) return cached.json;
+  const json = userJson(forge, origin);
+  userJsonCache.set(forge, { origin, json });
+  return json;
 }
 
 type Json = Record<string, unknown>;
@@ -94,6 +150,13 @@ export function restSegments(pathname: string): string[] {
 export function bearerOf(req: IncomingMessage): string | null {
   const header = req.headers.authorization;
   if (typeof header !== 'string') return null;
+  // The shape every client sends: "Bearer <token>", one space, no surrounding whitespace. It reads
+  // the same token the pattern below would; anything else takes the pattern.
+  if (header.length > 7 && header.startsWith('Bearer ')) {
+    const token = header.slice(7);
+    const last = token.charCodeAt(token.length - 1);
+    if (token.charCodeAt(0) > 32 && last > 32 && token.indexOf(' ') < 0 && token.indexOf('\t') < 0) return token;
+  }
   const match = /^Bearer\s+(.+)$/i.exec(header.trim());
   if (match === null) return null;
   const token = (match[1] ?? '').trim();
@@ -259,7 +322,7 @@ function issueJson(forge: Forge, repo: Repo, issue: IssueRecord, origin: string)
     state: issue.state,
     state_reason: issue.state === 'closed' ? 'completed' : null,
     labels: issue.labels.map((name) => labelJson(repo, repo.labels.get(name) ?? { name, color: 'ededed', description: '' }, origin)),
-    user: userJson(forge, origin),
+    user: cachedUserJson(forge, origin),
     assignee: null,
     assignees: [],
     milestone: null,
@@ -332,11 +395,97 @@ function pullJson(forge: Forge, repo: Repo, pull: PullRecord, origin: string): J
 // ---------------------------------------------------------------------------------------------
 // the router
 
+/** A path segment as restSegments decodes it: percent-decoded when it holds an escape, else as-is. */
+function decodeSegment(raw: string): string {
+  if (raw.indexOf('%') < 0) return raw;
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
+/** `/api/v3/repos/<owner>/<repo>/issues/<digits>` with nothing after the number. */
+interface IssueGetHit {
+  readonly owner: string;
+  readonly repo: string;
+  readonly number: number;
+}
+
+/**
+ * The issue-GET shape of `pathname`, or null when the path is anything else. Only the exact strict
+ * shape matches — a trailing slash, a query-looking tail, a non-digit number, an empty owner or repo
+ * name all return null, and the router answers those the way it always has.
+ */
+function issueGetMatch(pathname: string): IssueGetHit | null {
+  const start = 14; // after '/api/v3/repos/'
+  const length = pathname.length;
+  const ownerEnd = pathname.indexOf('/', start);
+  if (ownerEnd <= start) return null;
+  const repoEnd = pathname.indexOf('/', ownerEnd + 1);
+  if (repoEnd <= ownerEnd + 1) return null;
+  // '/issues/' then digits to the end
+  if (pathname.slice(repoEnd + 1, repoEnd + 8) !== 'issues/') return null;
+  const digitsAt = repoEnd + 8;
+  if (digitsAt >= length) return null;
+  let number = 0;
+  for (let index = digitsAt; index < length; index += 1) {
+    const code = pathname.charCodeAt(index);
+    if (code < 48 || code > 57) return null;
+    number = number * 10 + (code - 48);
+    if (number > 2 ** 52) return null;
+  }
+  return {
+    owner: decodeSegment(pathname.slice(start, ownerEnd)),
+    repo: decodeSegment(pathname.slice(ownerEnd + 1, repoEnd)),
+    number,
+  };
+}
+
+/**
+ * The issue-GET route, end to end: the same checks in the same order the router makes them (token,
+ * owner, repository, issue), then the cached body with its own header block.
+ */
+function serveIssueGet(rest: RestRequest, hit: IssueGetHit): void {
+  const { req, res, forge, requestId } = rest;
+  const token = bearerOf(req);
+  if (token === null) return sendError(res, requestId, 401, 'Requires authentication');
+  if (!forge.authenticate(token)) return sendError(res, requestId, 401, 'Bad credentials');
+  if (!forge.ownsLogin(hit.owner)) return sendError(res, requestId, 404, 'Not Found');
+  const repo = forge.getRepo(hit.owner, hit.repo);
+  if (repo === null) return sendError(res, requestId, 404, 'Not Found');
+  const issues = repo.issues;
+  let issue: IssueRecord | undefined;
+  for (let index = 0; index < issues.length; index += 1) {
+    const candidate = issues[index] as IssueRecord;
+    if (candidate.number === hit.number) {
+      issue = candidate;
+      break;
+    }
+  }
+  if (issue === undefined) return sendError(res, requestId, 404, 'Not Found');
+  const body = issueBodyOf(forge, repo, issue, rest.origin);
+  // The raw header list: Node writes it out without validating or re-keying an object per request.
+  res.writeHead(200, ['content-type', JSON_TYPE, 'content-length', body.length, 'x-github-request-id', requestId]);
+  res.end(body.bytes);
+}
+
 /** Answer one /api/v3 request. */
 export function handleRest(rest: RestRequest): void {
-  const { req, res, forge, requestId, url, method } = rest;
-  const segments = restSegments(url.pathname);
-  const query = url.searchParams;
+  const { req, res, forge, requestId, method } = rest;
+  const pathname = rest.pathname;
+
+  // The hot route: a GET of one issue, which is most of what the read workload asks for. It is
+  // matched on the raw path and answered from the serialization cache, without building the segment
+  // list. Every other shape of that path (a trailing slash, a non-numeric number, another method)
+  // falls through to the router below and gets the answer it already gets.
+  if (method === 'GET' && pathname.charCodeAt(14) === 114 /* r: /api/v3/repos/ */) {
+    const hit = issueGetMatch(pathname);
+    if (hit !== null) return serveIssueGet(rest, hit);
+  }
+
+  const segments = restSegments(pathname);
+  const query = rest.query;
 
   // The API root and /meta are readable without a token, as they are on api.github.com.
   if (segments.length === 0) {
@@ -598,7 +747,7 @@ function handleContents(rest: RestRequest, repo: Repo, sub: string[]): void {
 }
 
 function getContents(rest: RestRequest, repo: Repo, path: string): void {
-  const ref = rest.url.searchParams.get('ref');
+  const ref = rest.query.get('ref');
   const commit = rest.forge.resolveRef(repo, ref);
   if (commit === null) return sendError(rest.res, rest.requestId, 404, 'Not Found');
   const hit = rest.forge.lookupPath(repo, commit, path);
