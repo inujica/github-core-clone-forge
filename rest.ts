@@ -91,7 +91,7 @@ export function restSegments(pathname: string): string[] {
 }
 
 /** The bearer token a request presents, or null. */
-function bearerOf(req: IncomingMessage): string | null {
+export function bearerOf(req: IncomingMessage): string | null {
   const header = req.headers.authorization;
   if (typeof header !== 'string') return null;
   const match = /^Bearer\s+(.+)$/i.exec(header.trim());
@@ -1186,19 +1186,23 @@ function pullFiles(rest: RestRequest, repo: Repo, pull: PullRecord): void {
   sendJson(rest.res, rest.requestId, 200, changedFilesOf(rest.forge, repo, pull));
 }
 
-function mergePull(rest: RestRequest, repo: Repo, pull: PullRecord): void {
-  if (pull.state !== 'open') {
-    return sendError(rest.res, rest.requestId, 405, 'Pull Request is not mergeable');
-  }
-  const baseCommit = rest.forge.resolveRef(repo, pull.base);
-  const headCommit = rest.forge.resolveRef(repo, pull.headSha);
-  if (baseCommit === null || headCommit === null) {
-    return sendError(rest.res, rest.requestId, 405, 'Pull Request is not mergeable');
-  }
+/** What merging one pull request did: the squash commit's sha, or why it refused. */
+export type MergeOutcome = { readonly ok: true; readonly sha: string } | { readonly ok: false; readonly reason: string };
+
+/**
+ * Merge `pull` into its base branch: the work PUT /pulls/{number}/merge does, with no HTTP envelope, so
+ * the MCP surface moves the same store the same way REST does. A pull that is not open, whose branches
+ * have no commits, or that conflicts on a path both sides changed is refused with its reason.
+ */
+export function mergePullInto(forge: Forge, repo: Repo, pull: PullRecord, commitMessage?: string): MergeOutcome {
+  if (pull.state !== 'open') return { ok: false, reason: 'Pull Request is not mergeable' };
+  const baseCommit = forge.resolveRef(repo, pull.base);
+  const headCommit = forge.resolveRef(repo, pull.headSha);
+  if (baseCommit === null || headCommit === null) return { ok: false, reason: 'Pull Request is not mergeable' };
   // A conflict is a path both sides changed since the merge base.
-  const base = mergeBaseOf(rest.forge, repo, pull);
-  if (base === null) return sendError(rest.res, rest.requestId, 405, 'Pull Request is not mergeable');
-  const headChanges = changedFilesOf(rest.forge, repo, pull);
+  const base = mergeBaseOf(forge, repo, pull);
+  if (base === null) return { ok: false, reason: 'Pull Request is not mergeable' };
+  const headChanges = changedFilesOf(forge, repo, pull);
   for (const file of headChanges) {
     const path = String(file.filename);
     const ancestor = base.files.get(path);
@@ -1206,13 +1210,14 @@ function mergePull(rest: RestRequest, repo: Repo, pull: PullRecord): void {
     const theirs = headCommit.files.get(path);
     const ancestorBytes = ancestor === undefined ? null : ancestor;
     const currentBytes = current === undefined ? null : current;
+    const theirsBytes = theirs === undefined ? null : theirs;
     const sameAsAncestor = (a: Buffer | null, b: Buffer | null): boolean => {
       if (a === null && b === null) return true;
       if (a === null || b === null) return false;
       return a.equals(b);
     };
-    if (!sameAsAncestor(currentBytes, ancestorBytes) && !sameAsAncestor(theirs, ancestorBytes) && !sameAsAncestor(currentBytes, theirs)) {
-      return sendError(rest.res, rest.requestId, 405, 'Pull Request is not mergeable');
+    if (!sameAsAncestor(currentBytes, ancestorBytes) && !sameAsAncestor(theirsBytes, ancestorBytes) && !sameAsAncestor(currentBytes, theirsBytes)) {
+      return { ok: false, reason: 'Pull Request is not mergeable' };
     }
   }
   const files = new Map(baseCommit.files);
@@ -1222,9 +1227,8 @@ function mergePull(rest: RestRequest, repo: Repo, pull: PullRecord): void {
     if (theirs === undefined) files.delete(path);
     else files.set(path, theirs);
   }
-  const body = asObject(rest.body) ?? {};
-  const message = asString(body.commit_message) ?? `Merge pull request #${pull.number} from ${repo.owner}/${pull.head}`;
-  const record = rest.forge.writeCommit(repo, {
+  const message = commitMessage ?? `Merge pull request #${pull.number} from ${repo.owner}/${pull.head}`;
+  const record = forge.writeCommit(repo, {
     branch: pull.base,
     files,
     message,
@@ -1232,11 +1236,18 @@ function mergePull(rest: RestRequest, repo: Repo, pull: PullRecord): void {
   });
   pull.state = 'closed';
   pull.merged = true;
-  pull.mergedAt = rest.forge.nowIso;
+  pull.mergedAt = forge.nowIso;
   pull.mergeCommitSha = record.sha;
-  pull.updatedAt = rest.forge.nowIso;
+  pull.updatedAt = forge.nowIso;
+  return { ok: true, sha: record.sha };
+}
+
+function mergePull(rest: RestRequest, repo: Repo, pull: PullRecord): void {
+  const body = asObject(rest.body) ?? {};
+  const outcome = mergePullInto(rest.forge, repo, pull, asString(body.commit_message) ?? undefined);
+  if (!outcome.ok) return sendError(rest.res, rest.requestId, 405, outcome.reason);
   sendJson(rest.res, rest.requestId, 200, {
-    sha: record.sha,
+    sha: outcome.sha,
     merged: true,
     message: 'Pull Request successfully merged',
   });

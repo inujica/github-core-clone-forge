@@ -13,6 +13,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { handleGitHttp } from './git.ts';
 import { handleGraphQL } from './graphql.ts';
+import { handleMcp, MCP_PATH } from './mcp.ts';
 import { handleRest } from './rest.ts';
 import { Forge } from './store.ts';
 
@@ -113,6 +114,22 @@ async function handle(req: IncomingMessage, res: ServerResponse, forge: Forge, r
   if (pathname === '/healthz' || pathname === '/healthz/') {
     if (BODY_METHODS.has(method)) await readBody(req).catch(() => Buffer.alloc(0));
     return sendJson(res, requestId, 200, { ok: true });
+  }
+
+  // The Model Context Protocol endpoint. Its body is JSON-RPC, and a body that is not JSON must answer
+  // HTTP 400 with JSON-RPC -32700, so it reads its own bytes here instead of the generic JSON parse
+  // below (which would answer a plain {"message": ...} 400).
+  if (pathname === MCP_PATH || pathname === `${MCP_PATH}/`) {
+    let raw: Buffer = Buffer.alloc(0);
+    if (BODY_METHODS.has(method)) {
+      try {
+        raw = await readBody(req);
+      } catch {
+        return sendJson(res, requestId, 413, { message: 'Request body too large' });
+      }
+    }
+    handleMcp({ req, res, forge, requestId, method, origin, raw });
+    return;
   }
 
   // The git smart-HTTP surface. It is routed before the JSON body parse: its bodies are pkt-lines
