@@ -11,8 +11,8 @@ No dependency, no git binary, no network: the standard library plus the files in
 | --- | --- |
 | REST v3 — repositories, branches, commits, contents, labels, issues, pull requests | implemented |
 | Wire protocol — JSON everywhere, `X-GitHub-Request-Id`, JSON 404s, 400 on malformed bodies, 401 without a token | implemented |
-| Git smart HTTP (upload-pack v2, receive-pack v0) | not yet |
-| GraphQL v4 | not yet |
+| Git smart HTTP (upload-pack v2, receive-pack v0) | implemented |
+| GraphQL v4 (`POST /api/graphql`) | implemented |
 | MCP (`/mcp`) | not yet |
 
 ## Layout
@@ -21,6 +21,9 @@ No dependency, no git binary, no network: the standard library plus the files in
   poll `/done`, exit 0. Unchanged from the starter.
 - `app.ts` — the HTTP server: `/healthz`, `/api/v3/...`, JSON 404 for everything else.
 - `rest.ts` — the REST v3 router and handlers (repos, contents, git refs, labels, issues, pulls).
+- `graphql.ts` — the GraphQL v4 surface: its own tokenizer, parser and selection-set executor over a
+  resolver table that is also what `__type` introspects. Reads and writes the same store REST does.
+- `git.ts` — git smart HTTP: upload-pack (protocol v2) and receive-pack (v0), packs and deltas.
 - `store.ts` — the in-memory forge: repositories, branches, commits, git objects, issues, pulls.
 - `gitobj.ts` — real git object ids: `sha1("<type> <len>\0" + body)` for blobs, trees and commits.
 
@@ -33,4 +36,8 @@ No dependency, no git binary, no network: the standard library plus the files in
   `GET` returns the blob's base64 content and its git sha; `DELETE` commits the removal.
 - Everything is deterministic: no `Date.now()` and no `Math.random()` reach a response. Dates come
   from `MAKEFUN_TRIAL_NOW` and ids from counters, so a live run and its replay answer alike.
+- `POST /api/graphql` takes `{query, variables}` (or a JSON array of them, answered in order) with the
+  same bearer token REST takes and answers `{data, errors}`: an unknown field is a 200 carrying
+  `errors`, an unknown repository is `data.repository = null` with no errors, and a global id is
+  base64 of `Type:repoId:recordId` — opaque, deterministic and identical on every read.
 - State is in process memory (a `Map`); nothing is persisted.

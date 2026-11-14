@@ -12,6 +12,7 @@
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { handleGitHttp } from './git.ts';
+import { handleGraphQL } from './graphql.ts';
 import { handleRest } from './rest.ts';
 import { Forge } from './store.ts';
 
@@ -158,6 +159,12 @@ async function handle(req: IncomingMessage, res: ServerResponse, forge: Forge, r
         return sendJson(res, requestId, 400, { message: 'Problems parsing JSON' });
       }
     }
+  }
+
+  // The GraphQL v4 surface: one POST path, its own {data, errors} envelope.
+  if (pathname === '/api/graphql' || pathname === '/api/graphql/') {
+    handleGraphQL({ req, res, forge, requestId, method, body });
+    return;
   }
 
   const isRest = pathname === '/api/v3' || pathname.startsWith('/api/v3/');
