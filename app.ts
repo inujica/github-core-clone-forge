@@ -11,7 +11,7 @@
 // and its replay answer byte for byte alike.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { handleRest, restSegments } from './rest.ts';
+import { handleRest } from './rest.ts';
 import { Forge } from './store.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
@@ -129,7 +129,6 @@ async function handle(req: IncomingMessage, res: ServerResponse, forge: Forge, r
     }
   }
 
-  const segments = restSegments(pathname);
   const isRest = pathname === '/api/v3' || pathname.startsWith('/api/v3/');
   if (isRest) {
     handleRest({ req, res, forge, requestId, url, body, method, origin });
@@ -137,8 +136,5 @@ async function handle(req: IncomingMessage, res: ServerResponse, forge: Forge, r
   }
 
   // Everything else — including a git smart-HTTP path this forge does not serve yet — is a JSON 404.
-  if (segments.length > 0) {
-    return sendJson(res, requestId, 404, { message: 'Not Found' });
-  }
   return sendJson(res, requestId, 404, { message: 'Not Found' });
 }
