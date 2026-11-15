@@ -59,6 +59,30 @@ interface CachedIssueBody {
 
 const issueBodyCache = new WeakMap<IssueRecord, CachedIssueBody>();
 
+/**
+ * Issue number -> record, per repository. The hot route used to walk `repo.issues` looking for the
+ * number on every single GET, which is O(issues) per request and O(issues^2) over the read workload.
+ * The map is rebuilt only when the store's epoch moves, so a run of reads builds it once and a
+ * write only pays one rebuild. A number that appears twice resolves to the first record, exactly as
+ * the linear scan did.
+ */
+interface IssueIndex {
+  readonly epoch: number;
+  readonly byNumber: Map<number, IssueRecord>;
+}
+const issueIndexCache = new WeakMap<Repo, IssueIndex>();
+
+function issueIndexOf(repo: Repo): Map<number, IssueRecord> {
+  const cached = issueIndexCache.get(repo);
+  if (cached !== undefined && cached.epoch === storeEpoch) return cached.byNumber;
+  const byNumber = new Map<number, IssueRecord>();
+  for (const issue of repo.issues) {
+    if (!byNumber.has(issue.number)) byNumber.set(issue.number, issue);
+  }
+  issueIndexCache.set(repo, { epoch: storeEpoch, byNumber });
+  return byNumber;
+}
+
 /** An issue's JSON body as bytes (with the trailing newline sendJson adds), cached per issue. */
 function issueBodyOf(forge: Forge, repo: Repo, issue: IssueRecord, origin: string): CachedIssueBody {
   const cached = issueBodyCache.get(issue);
@@ -291,28 +315,70 @@ function commitJson(forge: Forge, repo: Repo, record: CommitRecord, origin: stri
   };
 }
 
+/**
+ * The two URL prefixes every rendered object in a repository shares. Rendering one issue built the
+ * same `origin + /api/v3/repos/owner/name` string six times, so it is built once per repository and
+ * origin instead. Both parts are pure functions of the repo's owner, name and the request origin.
+ */
+const repoPrefixCache = new WeakMap<Repo, { origin: string; api: string; html: string }>();
+
+function repoPrefixes(repo: Repo, origin: string): { api: string; html: string } {
+  const cached = repoPrefixCache.get(repo);
+  if (cached !== undefined && cached.origin === origin) return cached;
+  const entry = {
+    origin,
+    api: `${origin}/api/v3/repos/${repo.owner}/${repo.name}`,
+    html: `${origin}/${repo.owner}/${repo.name}`,
+  };
+  repoPrefixCache.set(repo, entry);
+  return entry;
+}
+
 /** A label as GitHub renders it. */
 function labelJson(repo: Repo, label: LabelRecord, origin: string): Json {
+  const id = labelIdOf(repo, label.name);
   return {
-    id: labelIdOf(repo, label.name),
-    node_id: `L_${labelIdOf(repo, label.name)}`,
+    id,
+    node_id: `L_${id}`,
     name: label.name,
     color: label.color,
     description: label.description === '' ? null : label.description,
     default: false,
-    url: `${origin}/api/v3/repos/${repo.owner}/${repo.name}/labels/${encodeURIComponent(label.name)}`,
+    url: `${repoPrefixes(repo, origin).api}/labels/${encodeURIComponent(label.name)}`,
   };
+}
+
+/**
+ * Label name -> its stable numeric id, per repository. The id is the label's position in the
+ * repository's label table, so it has to be recomputed when that table moves — which the store's
+ * epoch already tracks. Building the whole table once keeps `issueJson` from spreading every label
+ * name into a fresh array for each label of each issue it renders.
+ */
+const labelIdCache = new WeakMap<Repo, { epoch: number; ids: Map<string, number> }>();
+
+function labelIdsOf(repo: Repo): Map<string, number> {
+  const cached = labelIdCache.get(repo);
+  if (cached !== undefined && cached.epoch === storeEpoch) return cached.ids;
+  const ids = new Map<string, number>();
+  let index = 0;
+  for (const name of repo.labels.keys()) {
+    ids.set(name, 1_000_000 + index);
+    index += 1;
+  }
+  labelIdCache.set(repo, { epoch: storeEpoch, ids });
+  return ids;
 }
 
 /** A stable numeric id for a label, from its position in the repository's label table. */
 function labelIdOf(repo: Repo, name: string): number {
-  const names = [...repo.labels.keys()];
-  const index = names.indexOf(name);
-  return 1_000_000 + (index < 0 ? 0 : index);
+  const id = labelIdsOf(repo).get(name);
+  return id === undefined ? 1_000_000 : id;
 }
 
 /** An issue as GitHub renders it. */
 function issueJson(forge: Forge, repo: Repo, issue: IssueRecord, origin: string): Json {
+  const { api, html } = repoPrefixes(repo, origin);
+  const at = `${api}/issues/${issue.number}`;
   return {
     id: issue.id,
     node_id: `I_${issue.id}`,
@@ -331,11 +397,11 @@ function issueJson(forge: Forge, repo: Repo, issue: IssueRecord, origin: string)
     created_at: issue.createdAt,
     updated_at: issue.updatedAt,
     closed_at: issue.closedAt,
-    url: `${origin}/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`,
-    repository_url: `${origin}/api/v3/repos/${repo.owner}/${repo.name}`,
-    html_url: `${origin}/${repo.owner}/${repo.name}/issues/${issue.number}`,
-    comments_url: `${origin}/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}/comments`,
-    events_url: `${origin}/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}/events`,
+    url: at,
+    repository_url: api,
+    html_url: `${html}/issues/${issue.number}`,
+    comments_url: `${at}/comments`,
+    events_url: `${at}/events`,
   };
 }
 
@@ -454,15 +520,7 @@ function serveIssueGet(rest: RestRequest, hit: IssueGetHit): void {
   if (!forge.ownsLogin(hit.owner)) return sendError(res, requestId, 404, 'Not Found');
   const repo = forge.getRepo(hit.owner, hit.repo);
   if (repo === null) return sendError(res, requestId, 404, 'Not Found');
-  const issues = repo.issues;
-  let issue: IssueRecord | undefined;
-  for (let index = 0; index < issues.length; index += 1) {
-    const candidate = issues[index] as IssueRecord;
-    if (candidate.number === hit.number) {
-      issue = candidate;
-      break;
-    }
-  }
+  const issue = issueIndexOf(repo).get(hit.number);
   if (issue === undefined) return sendError(res, requestId, 404, 'Not Found');
   const body = issueBodyOf(forge, repo, issue, rest.origin);
   // The raw header list: Node writes it out without validating or re-keying an object per request.
